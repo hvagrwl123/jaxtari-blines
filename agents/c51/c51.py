@@ -118,7 +118,8 @@ class EpisodeStatistics:
     returned_episode_lengths: jnp.array
 
 
-def build_eval_fn(env, apply_fn, atoms, eval_episodes, max_steps, action_dim):
+def build_eval_fn(env, apply_fn, v_min, v_max, n_atoms, eval_episodes, max_steps, action_dim):
+    atoms = jnp.linspace(v_min, v_max, n_atoms)
     def wrapped_reset(key):
         next_obs, state = env.reset(key)
         return next_obs.squeeze()[None, ...], state
@@ -268,7 +269,9 @@ def single_run(config: dict):
     eval_fn = build_eval_fn(
         env=eval_env,
         apply_fn=network.apply,
-        atoms=atoms,
+        v_min=v_min,
+        v_max=v_max,
+        n_atoms=n_atoms,
         eval_episodes=eval_episodes,
         max_steps=eval_max_steps,
         action_dim=action_dim,

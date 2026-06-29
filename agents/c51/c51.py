@@ -1,6 +1,5 @@
 # Adapted from https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/c51_atari_jax.py
 import os
-import random
 import time
 from functools import partial
 from typing import NamedTuple
@@ -13,32 +12,22 @@ import numpy as np
 import optax
 import flashbax as fbx
 import wandb
-from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
-
 import jaxatari
 from jaxatari.wrappers import (
-    AtariWrapper,
-    FlattenObservationWrapper,
-    LogWrapper,
     NormalizeObservationWrapper,
     ObjectCentricWrapper,
     PixelObsWrapper,
+    AtariWrapper,
+    LogWrapper,
+    FlattenObservationWrapper,
 )
+from agents.c51.c51_eval import evaluate
 
 
-def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=False):
+def make_env(env_id, pixel_based=True, native_downscaling=True, eval=False):
     def thunk():
-        active_mods = mods
-        if not eval and isinstance(active_mods, (list, tuple)) and len(active_mods) > 1:
-            active_mods = []
-
-        if isinstance(active_mods, (list, tuple)) and len(active_mods) == 0:
-            mods_arg = None
-        else:
-            mods_arg = active_mods
-
-        env = jaxatari.make(env_id, mods=mods_arg)
+        env = jaxatari.make(env_id)
         env = AtariWrapper(
             env,
             sticky_actions=0.0,
@@ -76,7 +65,7 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
     return thunk
 
 
-class QNetwork(nn.Module):
+class QNetworkPixel(nn.Module):
     action_dim: int
     n_atoms: int
 
@@ -98,20 +87,20 @@ class QNetwork(nn.Module):
         return jax.nn.softmax(x, axis=-1)
 
 
-class MLP_QNetwork(nn.Module):
+class QNetworkOC(nn.Module):
     action_dim: int
     n_atoms: int
 
     @nn.compact
     def __call__(self, x):
         x = x.astype(jnp.float32)
-        x = nn.Dense(461, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.Dense(512)(x)
         x = nn.LayerNorm()(x)
         x = nn.relu(x)
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.Dense(512)(x)
         x = nn.LayerNorm()(x)
         x = nn.relu(x)
-        x = nn.Dense(self.action_dim * self.n_atoms, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+        x = nn.Dense(self.action_dim * self.n_atoms)(x)
         x = x.reshape((x.shape[0], self.action_dim, self.n_atoms))
         return jax.nn.softmax(x, axis=-1)
 
@@ -130,7 +119,6 @@ class EpisodeStatistics:
 
 
 def build_eval_fn(env, apply_fn, atoms, eval_episodes, max_steps, action_dim):
-
     def wrapped_reset(key):
         next_obs, state = env.reset(key)
         return next_obs.squeeze()[None, ...], state
@@ -144,7 +132,6 @@ def build_eval_fn(env, apply_fn, atoms, eval_episodes, max_steps, action_dim):
         pmfs = apply_fn(params, obs)
         q_values = (pmfs * atoms[None, None, :]).sum(-1)
         greedy_action = jnp.argmax(q_values, axis=1)
-
         key, subkey = jax.random.split(key)
         random_action = jax.random.randint(subkey, greedy_action.shape, 0, action_dim)
         explore = jax.random.uniform(key, greedy_action.shape) < epsilon
@@ -153,24 +140,21 @@ def build_eval_fn(env, apply_fn, atoms, eval_episodes, max_steps, action_dim):
 
     def step_fn(carry, _):
         obs, env_state, keys, params, epsilon = carry
-
         actions, keys = jax.vmap(get_action, in_axes=(None, 0, 0, None))(params, obs, keys, epsilon)
         next_obs, next_env_state, reward, done, info = jax.vmap(wrapped_step)(env_state, actions)
         first_state = jax.tree.map(lambda x: x[0], next_env_state)
-
         return (next_obs, next_env_state, keys, params, epsilon), (first_state, done, reward)
 
     @jax.jit
     def eval_fn(params, reset_keys, epsilon):
         obs, env_state = jax.vmap(wrapped_reset)(reset_keys)
-
         _, (first_states_history, dones, rewards) = jax.lax.scan(
-            step_fn, (obs, env_state, reset_keys, params, epsilon), None, length=max_steps)
+            step_fn, (obs, env_state, reset_keys, params, epsilon), None, length=max_steps
+        )
         has_finished = jax.lax.cummax(dones.astype(jnp.int32), axis=0)
         mask_after_first_done = jnp.pad(has_finished[:-1, :], ((1, 0), (0, 0)), constant_values=0)
         masked_rewards = rewards * (1 - mask_after_first_done)
         episodic_returns = jnp.sum(masked_rewards, axis=0)
-
         first_done = jnp.argmax(dones, axis=0)
         return episodic_returns, first_states_history, first_done
 
@@ -178,17 +162,12 @@ def build_eval_fn(env, apply_fn, atoms, eval_episodes, max_steps, action_dim):
 
 
 def single_run(config: dict):
+    import random
     config = {k.upper(): v for k, v in config.items() if k != "alg"}
 
-    if isinstance(config.get("TRAIN_MODS"), list):
-        config["TRAIN_MODS"] = tuple(config["TRAIN_MODS"])
-    if isinstance(config.get("EVAL_MODS"), list):
-        config["EVAL_MODS"] = tuple(config["EVAL_MODS"])
-
-    if config.get("PIXEL_BASED", True) and config.get("NUM_ENVS", 1) > 16:
-        config["NUM_ENVS"] = 8
-
-    run_name = f"{config['ENV_ID']}_{config['EXP_NAME']}_{'oc' if not config['PIXEL_BASED'] else 'pixel'}_{config['SEED']}"
+    pixel_based = config.get("PIXEL_BASED", True)
+    num_envs = config.get("NUM_ENVS", 1)
+    run_name = f"{config['ENV_ID']}_{config['EXP_NAME']}_{'oc' if not pixel_based else 'pixel'}_{config['SEED']}"
 
     wandb.init(
         project=config.get("PROJECT", "jaxtari-blines"),
@@ -198,22 +177,20 @@ def single_run(config: dict):
         save_code=True,
     )
 
-    # do not modify the seeding
     random.seed(config["SEED"])
     np.random.seed(config["SEED"])
     key = jax.random.PRNGKey(config["SEED"])
 
     env = make_env(
         config.get("ENV_ID"),
-        list(config.get("TRAIN_MODS", [])),
-        config.get("PIXEL_BASED", True),
+        pixel_based,
         config.get("NATIVE_DOWNSCALING", True),
         False,
     )()
 
     action_dim = env.action_space().n
     obs_shape = env.observation_space().shape
-    if config.get("PIXEL_BASED", True):
+    if pixel_based:
         obs_shape = obs_shape[:-1]
 
     @jax.jit
@@ -230,23 +207,22 @@ def single_run(config: dict):
     n_atoms = config.get("N_ATOMS", 51)
     v_min = config.get("V_MIN", -10.0)
     v_max = config.get("V_MAX", 10.0)
-    gamma = config.get("GAMMA", 0.99)
-    batch_size = config.get("BATCH_SIZE", 32)
+    atoms = jnp.linspace(v_min, v_max, n_atoms)
     delta_z = (v_max - v_min) / (n_atoms - 1)
 
     key, q_key = jax.random.split(key, 2)
     network = (
-        QNetwork(action_dim=action_dim, n_atoms=n_atoms)
-        if config.get("PIXEL_BASED", True)
-        else MLP_QNetwork(action_dim=action_dim, n_atoms=n_atoms)
+        QNetworkPixel(action_dim=action_dim, n_atoms=n_atoms)
+        if pixel_based
+        else QNetworkOC(action_dim=action_dim, n_atoms=n_atoms)
     )
+
     dummy_obs = jnp.zeros((1, *obs_shape))
     q_params = network.init(q_key, dummy_obs)
-    atoms = jnp.linspace(v_min, v_max, n_atoms)
 
-    tx = optax.chain(
-        optax.clip_by_global_norm(10.0),
-        optax.adam(config.get("LEARNING_RATE", 2.5e-4), eps=0.01 / batch_size),
+    tx = optax.adam(
+        learning_rate=config.get("LEARNING_RATE"),
+        eps=0.01 / config.get("BATCH_SIZE", 32),
     )
 
     agent_state = C51TrainState.create(
@@ -257,11 +233,11 @@ def single_run(config: dict):
         tx=tx,
     )
 
-    obs_dtype = jnp.uint8 if config.get("PIXEL_BASED", True) else jnp.float32
+    obs_dtype = jnp.uint8 if pixel_based else jnp.bfloat16
     replay_buffer = fbx.make_item_buffer(
-        max_length=config.get("BUFFER_SIZE", 100_000),
-        min_length=config.get("LEARNING_STARTS", 10_000),
-        sample_batch_size=batch_size,
+        max_length=config.get("BUFFER_SIZE", 100000),
+        min_length=config.get("LEARNING_STARTS", 10000),
+        sample_batch_size=config.get("BATCH_SIZE", 32),
         add_batches=True,
     )
     example_transition = {
@@ -274,56 +250,83 @@ def single_run(config: dict):
     buffer_state = replay_buffer.init(example_transition)
 
     episode_stats = EpisodeStatistics(
-        episode_returns=jnp.zeros(config["NUM_ENVS"], dtype=jnp.float32),
-        episode_lengths=jnp.zeros(config["NUM_ENVS"], dtype=jnp.int32),
-        returned_episode_returns=jnp.zeros(config["NUM_ENVS"], dtype=jnp.float32),
-        returned_episode_lengths=jnp.zeros(config["NUM_ENVS"], dtype=jnp.int32),
+        episode_returns=jnp.zeros(num_envs, dtype=jnp.float32),
+        episode_lengths=jnp.zeros(num_envs, dtype=jnp.int32),
+        returned_episode_returns=jnp.zeros(num_envs, dtype=jnp.float32),
+        returned_episode_lengths=jnp.zeros(num_envs, dtype=jnp.int32),
     )
-
-    eval_mods_list = list(config.get("EVAL_MODS", [])) or list(config.get("TRAIN_MODS", []))
-    eval_configs = [([], "default")]
-    for mod in eval_mods_list:
-        mods_cfg = list(mod) if isinstance(mod, (list, tuple)) else [mod]
-        mod_label = mod if isinstance(mod, str) else "_".join(str(m) for m in mods_cfg)
-        eval_configs.append((mods_cfg, mod_label))
 
     eval_episodes = 10
     eval_max_steps = 10000
 
-    eval_fns = {}
-    for mods_cfg, mod_label in eval_configs:
-        eval_env = make_env(
-            config["ENV_ID"],
-            mods=mods_cfg,
-            pixel_based=config.get("PIXEL_BASED", True),
-            native_downscaling=config.get("NATIVE_DOWNSCALING", True),
-            eval=True,
-        )()
-        eval_fns[mod_label] = build_eval_fn(
-            env=eval_env,
-            apply_fn=network.apply,
-            atoms=atoms,
-            eval_episodes=eval_episodes,
-            max_steps=eval_max_steps,
-            action_dim=action_dim,
-        )
+    eval_env = make_env(
+        config["ENV_ID"],
+        pixel_based=pixel_based,
+        native_downscaling=config.get("NATIVE_DOWNSCALING", True),
+        eval=True,
+    )()
+    eval_fn = build_eval_fn(
+        env=eval_env,
+        apply_fn=network.apply,
+        atoms=atoms,
+        eval_episodes=eval_episodes,
+        max_steps=eval_max_steps,
+        action_dim=action_dim,
+    )
 
-    def step_once(carry, unused_step):
+    gamma = config.get("GAMMA", 0.99)
+    batch_size = config.get("BATCH_SIZE", 32)
+
+    def update(agent_state, b_obs, b_act, b_nobs, b_rew, b_don):
+        next_pmfs = network.apply(agent_state.target_params, b_nobs)
+        next_vals = (next_pmfs * agent_state.atoms[None, None, :]).sum(-1)
+        next_act = jnp.argmax(next_vals, axis=-1)
+        next_pmfs = next_pmfs[jnp.arange(batch_size), next_act]
+
+        next_atoms = b_rew[:, None] + gamma * agent_state.atoms[None, :] * (1.0 - b_don[:, None])
+        tz = jnp.clip(next_atoms, v_min, v_max)
+        b = (tz - v_min) / delta_z
+        l = jnp.clip(jnp.floor(b).astype(jnp.int32), 0, n_atoms - 1)
+        u = jnp.clip(jnp.ceil(b).astype(jnp.int32), 0, n_atoms - 1)
+        d_l = (u.astype(jnp.float32) + (l == u).astype(jnp.float32) - b) * next_pmfs
+        d_u = (b - l.astype(jnp.float32)) * next_pmfs
+
+        target_pmfs = jnp.zeros((batch_size, n_atoms))
+
+        def project_sample(i, val):
+            val = val.at[i, l[i]].add(d_l[i])
+            val = val.at[i, u[i]].add(d_u[i])
+            return val
+
+        target_pmfs = jax.lax.fori_loop(0, batch_size, project_sample, target_pmfs)
+        target_pmfs = jax.lax.stop_gradient(target_pmfs)
+
+        def loss_fn(params):
+            pmfs = network.apply(params, b_obs)
+            q_pred = pmfs[jnp.arange(batch_size), b_act]
+            q_pred_clipped = jnp.clip(q_pred, 1e-5, 1 - 1e-5)
+            loss = -(target_pmfs * jnp.log(q_pred_clipped)).sum(-1).mean()
+            return loss, q_pred
+
+        (loss, _), grads = jax.value_and_grad(loss_fn, has_aux=True)(agent_state.params)
+        new_state = agent_state.apply_gradients(grads=grads)
+        return new_state, loss
+
+    def step_once(carry, _):
         state, buffer_state, env_state, obs, rng, global_step, ep_stats = carry
 
         rng, action_rng, explore_rng = jax.random.split(rng, 3)
         epsilon = jnp.interp(
             global_step,
-            jnp.array([0, config.get("EXPLORATION_FRACTION", 0.10) * config.get("TOTAL_TIMESTEPS", 10_000_000)]),
+            jnp.array([0, config.get("EXPLORATION_FRACTION", 0.10) * config.get("TOTAL_TIMESTEPS", 10000000)]),
             jnp.array([config.get("START_E", 1.0), config.get("END_E", 0.01)]),
         )
 
         pmfs = state.apply_fn(state.params, obs)
         q_values = (pmfs * state.atoms[None, None, :]).sum(-1)
         greedy_actions = q_values.argmax(axis=-1)
-        random_actions = jax.random.randint(action_rng, (config["NUM_ENVS"],), 0, action_dim)
-
-        explore_mask = jax.random.uniform(explore_rng, (config["NUM_ENVS"],)) < epsilon
+        random_actions = jax.random.randint(action_rng, (num_envs,), 0, action_dim)
+        explore_mask = jax.random.uniform(explore_rng, (num_envs,)) < epsilon
         actions = jnp.where(explore_mask, random_actions, greedy_actions)
 
         next_obs, next_env_state, rewards, next_done, infos = vmap_step(env_state, actions)
@@ -339,7 +342,6 @@ def single_run(config: dict):
 
         new_returns = ep_stats.episode_returns + rewards
         new_lengths = ep_stats.episode_lengths + 1
-
         ep_stats = ep_stats.replace(
             episode_returns=new_returns * (1 - next_done),
             episode_lengths=new_lengths * (1 - next_done),
@@ -347,153 +349,83 @@ def single_run(config: dict):
             returned_episode_lengths=jnp.where(next_done, new_lengths, ep_stats.returned_episode_lengths),
         )
 
-        updates_per_step = max(1, config["NUM_ENVS"] // config.get("TRAIN_FREQUENCY", 4))
-
         def do_update(update_carry, _):
             u_state, u_key = update_carry
             u_key, sample_key = jax.random.split(u_key)
-
             batch = replay_buffer.sample(buffer_state, sample_key).experience
-            b_obs = batch["obs"].astype(jnp.float32)
-            b_act = batch["action"]
-            b_rew = batch["reward"]
-            b_don = batch["done"].astype(jnp.float32)
-            b_nobs = batch["next_obs"].astype(jnp.float32)
+            new_u_state, loss = update(
+                u_state,
+                batch["obs"].astype(jnp.float32),
+                batch["action"],
+                batch["next_obs"].astype(jnp.float32),
+                batch["reward"],
+                batch["done"].astype(jnp.float32),
+            )
+            return (new_u_state, u_key), loss
 
-            def loss_fn(params):
-                next_pmfs_full = u_state.apply_fn(u_state.target_params, b_nobs)
-                next_vals = (next_pmfs_full * u_state.atoms[None, None, :]).sum(-1)
-                next_act = jnp.argmax(next_vals, axis=-1)
-                next_pmfs = next_pmfs_full[jnp.arange(batch_size), next_act]
+        should_train = (global_step % config.get("TRAIN_FREQUENCY", 4)) < num_envs
+        can_train = jnp.logical_and(replay_buffer.can_sample(buffer_state), should_train)
 
-                next_atoms = b_rew[:, None] + gamma * u_state.atoms[None, :] * (1.0 - b_don[:, None])
-                tz = jnp.clip(next_atoms, v_min, v_max)
-                b = (tz - v_min) / delta_z
-                l = jnp.clip(jnp.floor(b).astype(jnp.int32), 0, n_atoms - 1)
-                u = jnp.clip(jnp.ceil(b).astype(jnp.int32), 0, n_atoms - 1)
-                d_l = (u.astype(jnp.float32) + (l == u).astype(jnp.float32) - b) * next_pmfs
-                d_u = (b - l.astype(jnp.float32)) * next_pmfs
-                target_pmfs = jnp.zeros((batch_size, n_atoms))
-
-                def project_sample(i, val):
-                    val = val.at[i, l[i]].add(d_l[i])
-                    val = val.at[i, u[i]].add(d_u[i])
-                    return val
-
-                target_pmfs = jax.lax.fori_loop(0, batch_size, project_sample, target_pmfs)
-                target_pmfs = jax.lax.stop_gradient(target_pmfs)
-
-                pmfs = u_state.apply_fn(params, b_obs)
-                q_pred = pmfs[jnp.arange(batch_size), b_act.reshape(-1)]
-                q_pred_clipped = jnp.clip(q_pred, 1e-5, 1 - 1e-5)
-                loss = -(target_pmfs * jnp.log(q_pred_clipped)).sum(-1).mean()
-                q_vals = (q_pred * u_state.atoms[None, :]).sum(-1)
-                return loss, q_vals
-
-            (loss, q_val), grads = jax.value_and_grad(loss_fn, has_aux=True)(u_state.params)
-            new_state = u_state.apply_gradients(grads=grads)
-
-            return (new_state, u_key), loss
-
-        def run_updates(s_state, s_key):
-            (new_s_state, new_s_key), losses = jax.lax.scan(do_update, (s_state, s_key), None, length=updates_per_step)
-            return new_s_state, new_s_key, jnp.mean(losses)
-
-        should_train_step = (global_step % config.get("TRAIN_FREQUENCY", 4)) < config["NUM_ENVS"]
-        can_train = jnp.logical_and(replay_buffer.can_sample(buffer_state), should_train_step)
-
-        state, rng, avg_loss = jax.lax.cond(
+        (state, rng), losses = jax.lax.cond(
             can_train,
-            lambda c: run_updates(c[0], c[1]),
-            lambda c: (c[0], c[1], 0.0),
-            (state, rng)
+            lambda c: jax.lax.scan(do_update, c, None, length=1),
+            lambda c: (c, jnp.zeros(1)),
+            (state, rng),
         )
+        avg_loss = losses[0]
 
         update_target_flag = jnp.logical_and(
             can_train,
-            (global_step % config.get("TARGET_NETWORK_FREQUENCY", 1000)) < config["NUM_ENVS"]
+            (global_step % config.get("TARGET_NETWORK_FREQUENCY", 10000)) < num_envs,
         )
-
         new_target_params = jax.lax.cond(
             update_target_flag,
-            lambda _: optax.incremental_update(state.params, state.target_params, config.get("TAU", 1.0)),
+            lambda _: optax.incremental_update(state.params, state.target_params, 1.0),
             lambda _: state.target_params,
-            None
+            None,
         )
         state = state.replace(target_params=new_target_params)
 
-        global_step += config["NUM_ENVS"]
-        return (state, buffer_state, next_env_state, next_obs, rng, global_step, ep_stats), (avg_loss, epsilon)
+        global_step += num_envs
+        return (state, buffer_state, next_env_state, next_obs, rng, global_step, ep_stats), avg_loss
 
     def save_and_eval(step_count, agent_state):
-        model_path = ""
         if config.get("SAVE_PATH", "./models") is not None:
             model_path = f'{config.get("SAVE_PATH", "./models")}/{run_name}/{config["EXP_NAME"]}_{step_count}_{int(time.time())}.cleanrl_model'
             os.makedirs(os.path.dirname(model_path), exist_ok=True)
-
             with open(model_path, "wb") as f:
-                f.write(
-                    flax.serialization.to_bytes(
-                        (None, agent_state.params)
-                    )
-                )
+                f.write(flax.serialization.to_bytes((None, agent_state.params)))
             print(f"model saved to {model_path}")
 
         print(f"running evaluation at step {step_count}...")
+        reset_keys = jax.random.split(jax.random.PRNGKey(config["SEED"]), eval_episodes)
+        episodic_returns, _, _ = eval_fn(agent_state.params, reset_keys, 0.05)
+        avg_eval_return = float(jnp.mean(episodic_returns))
+        wandb.log({"eval/episodic_return": avg_eval_return}, step=step_count)
+        print(f"eval at step {step_count}: avg return = {avg_eval_return:.2f}")
+        return {"eval/episodic_return": avg_eval_return}
 
-        metrics = {}
-        for mods_cfg, mod_label in eval_configs:
-            reset_keys = jax.random.split(jax.random.PRNGKey(config["SEED"]), eval_episodes)
-
-            episodic_returns, first_states_history, first_done = eval_fns[mod_label](
-                agent_state.params, reset_keys, 0.05
-            )
-
-            avg_eval_return = float(jnp.mean(episodic_returns))
-            return_key = f"eval/episodic_return_{mod_label}"
-            metrics[return_key] = avg_eval_return
-            print(f"evaluation at step {step_count} ({mod_label}): average return = {avg_eval_return}")
-
-            wandb.log({return_key: avg_eval_return}, step=step_count)
-
-            if config.get("CAPTURE_VIDEO", False):
-                clean_renderer = jaxatari.make(config["ENV_ID"], mods=mods_cfg).renderer
-                env_states_until_done = jax.tree.map(
-                    lambda x: x[: first_done[0] + 1],
-                    first_states_history.atari_state.atari_state.env_state,
-                )
-                frames = jax.vmap(clean_renderer.render)(env_states_until_done)
-                frames = jnp.transpose(frames, (0, 3, 1, 2))
-                video = wandb.Video(np.array(frames), fps=30, format="mp4")
-
-                video_key = f"eval/video_{mod_label}"
-                wandb.log({video_key: video}, step=step_count)
-                print(f"video (eval) logged to wandb with {frames.shape} frames ({mod_label}).")
-
-        return metrics
-
-    CHUNK_SIZE = config["NUM_STEPS"] // config["NUM_ENVS"]
+    CHUNK_SIZE = config.get("CHUNK_SIZE", 1000)
 
     @partial(jax.jit, donate_argnums=(0,))
     def rollout_chunk(carry):
         return jax.lax.scan(step_once, carry, None, length=CHUNK_SIZE)
 
     key, reset_key = jax.random.split(key)
-    obs, env_state = vmap_reset(jax.random.split(reset_key, config["NUM_ENVS"]))
+    obs, env_state = vmap_reset(jax.random.split(reset_key, num_envs))
     global_step = jnp.array(0, dtype=jnp.int32)
 
     carry = (agent_state, buffer_state, env_state, obs, key, global_step, episode_stats)
 
     start_time = time.time()
     total_eval_time = 0.0
-    total_iterations = config.get("TOTAL_TIMESTEPS", 10_000_000) // (config["NUM_ENVS"] * CHUNK_SIZE)
+    total_iterations = config.get("TOTAL_TIMESTEPS", 10000000) // (num_envs * CHUNK_SIZE)
 
-    print(f"starting compilation and run ({total_iterations} chunks of {CHUNK_SIZE * config['NUM_ENVS']} steps)")
+    print(f"starting compilation and run ({total_iterations} chunks of {CHUNK_SIZE * num_envs} steps)")
 
     for i in range(1, total_iterations + 1):
         iteration_time_start = time.time()
-        carry, (losses, epsilons) = rollout_chunk(carry)
-
+        carry, losses = rollout_chunk(carry)
         agent_state, buffer_state, env_state, obs, key, global_step, episode_stats = carry
 
         current_step = global_step.item()
@@ -507,10 +439,14 @@ def single_run(config: dict):
         metrics = {
             "charts/avg_episodic_return": episode_stats.returned_episode_returns.mean().item(),
             "charts/avg_episodic_length": episode_stats.returned_episode_lengths.mean().item(),
-            "charts/epsilon": epsilons[-1].item(),
+            "charts/epsilon": float(jnp.interp(
+                current_step,
+                jnp.array([0, config.get("EXPLORATION_FRACTION", 0.10) * config.get("TOTAL_TIMESTEPS", 10000000)]),
+                jnp.array([config.get("START_E", 1.0), config.get("END_E", 0.01)]),
+            )),
             "charts/SPS": int(current_step / (time.time() - start_time - total_eval_time)),
-            "charts/SPS_update": int(CHUNK_SIZE * config["NUM_ENVS"] / iteration_time),
-            "losses/td_loss": float(jnp.sum(losses) / jnp.maximum(jnp.sum(losses != 0), 1)),
+            "charts/SPS_update": int(CHUNK_SIZE * num_envs / iteration_time),
+            "losses/td_loss": float(jnp.mean(losses)),
             "charts/global_step": current_step,
         }
         wandb.log(metrics, step=current_step)
@@ -519,9 +455,6 @@ def single_run(config: dict):
             sps = int(current_step / (time.time() - start_time - total_eval_time))
             print(f"step: {current_step} / {config.get('TOTAL_TIMESTEPS')} | SPS: {sps} | return: {episode_stats.returned_episode_returns.mean().item():.2f}")
 
-    eval_metrics = save_and_eval(config.get("TOTAL_TIMESTEPS", 10_000_000), agent_state)
-
+    save_and_eval(config.get("TOTAL_TIMESTEPS", 10000000), agent_state)
     wandb.finish()
-    print("[C51] Training complete.")
-
-    return eval_metrics
+    return {}

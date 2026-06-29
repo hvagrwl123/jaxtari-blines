@@ -234,7 +234,7 @@ def single_run(config: dict):
         tx=tx,
     )
 
-    obs_dtype = jnp.uint8 if pixel_based else jnp.bfloat16
+    obs_dtype = jnp.uint8 if pixel_based else jnp.float8_e4m3fn
     replay_buffer = fbx.make_item_buffer(
         max_length=config.get("BUFFER_SIZE", 100000),
         min_length=config.get("LEARNING_STARTS", 10000),
@@ -404,9 +404,9 @@ def single_run(config: dict):
         reset_keys = jax.random.split(jax.random.PRNGKey(config["SEED"]), eval_episodes)
         episodic_returns, _, _ = eval_fn(agent_state.params, reset_keys, 0.05)
         avg_eval_return = float(jnp.mean(episodic_returns))
-        wandb.log({"eval/episodic_return": avg_eval_return}, step=step_count)
+        wandb.log({"charts/episodic_return": avg_eval_return}, step=step_count)
         print(f"eval at step {step_count}: avg return = {avg_eval_return:.2f}")
-        return {"eval/episodic_return": avg_eval_return}
+        return {"charts/episodic_return": avg_eval_return}
 
     CHUNK_SIZE = config.get("CHUNK_SIZE", 1000)
 

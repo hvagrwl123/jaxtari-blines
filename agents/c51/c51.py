@@ -168,7 +168,7 @@ def single_run(config: dict):
 
     pixel_based = config.get("PIXEL_BASED", True)
     num_envs = config.get("NUM_ENVS", 1)
-    run_name = f"{config['ENV_ID']}_{config['EXP_NAME']}_{'oc' if not pixel_based else 'pixel'}_{config['SEED']}"
+    run_name = config.get("RUN_NAME", f"{config['ENV_ID']}_{config['EXP_NAME']}_{'oc' if not pixel_based else 'pixel'}_{config['SEED']}")
 
     wandb.init(
         project=config.get("PROJECT", "jaxtari-blines"),
@@ -234,7 +234,7 @@ def single_run(config: dict):
         tx=tx,
     )
 
-    obs_dtype = jnp.uint8 if pixel_based else jnp.float8_e4m3fn
+    obs_dtype = jnp.uint8 if pixel_based else jnp.bfloat16
     replay_buffer = fbx.make_item_buffer(
         max_length=config.get("BUFFER_SIZE", 100000),
         min_length=config.get("LEARNING_STARTS", 10000),

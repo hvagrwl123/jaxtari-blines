@@ -26,4 +26,4 @@ V_MAX: 21.0
 EVAL_EVERY: 10
 SAVE_PATH: ./models
 
-RUN_NAME: v7_oc_original
+RUN_NAME: v8_oc_original

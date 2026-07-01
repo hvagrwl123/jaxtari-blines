@@ -14,7 +14,7 @@ import flashbax as fbx
 import wandb
 from flax.training.train_state import TrainState
 import jaxatari
-from jaxatari.wrappers import 
+from jaxatari.wrappers import (
     NormalizeObservationWrapper,
     ObjectCentricWrapper,
     PixelObsWrapper,

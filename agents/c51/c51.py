@@ -14,7 +14,7 @@ import flashbax as fbx
 import wandb
 from flax.training.train_state import TrainState
 import jaxatari
-from jaxatari.wrappers import (
+from jaxatari.wrappers import 
     NormalizeObservationWrapper,
     ObjectCentricWrapper,
     PixelObsWrapper,
@@ -234,7 +234,7 @@ def single_run(config: dict):
         tx=tx,
     )
 
-    obs_dtype = jnp.uint8 if pixel_based else jnp.bfloat16
+    obs_dtype = jnp.uint8 if pixel_based else jnp.float16
     replay_buffer = fbx.make_item_buffer(
         max_length=config.get("BUFFER_SIZE", 100000),
         min_length=config.get("LEARNING_STARTS", 10000),

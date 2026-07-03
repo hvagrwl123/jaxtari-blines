@@ -279,6 +279,7 @@ def single_run(config: dict):
 
     gamma = config.get("GAMMA", 0.99)
     batch_size = config.get("BATCH_SIZE", 32)
+    updates_per_step = max(1, num_envs // config.get("TRAIN_FREQUENCY", 4))
 
     def update(agent_state, b_obs, b_act, b_nobs, b_rew, b_don):
         next_pmfs = network.apply(agent_state.target_params, b_nobs)
@@ -294,14 +295,10 @@ def single_run(config: dict):
         d_l = (u.astype(jnp.float32) + (l == u).astype(jnp.float32) - b) * next_pmfs
         d_u = (b - l.astype(jnp.float32)) * next_pmfs
 
-        target_pmfs = jnp.zeros((batch_size, n_atoms))
+        def project_one(l_i, u_i, dl_i, du_i):
+            return jnp.zeros(n_atoms).at[l_i].add(dl_i).at[u_i].add(du_i)
 
-        def project_sample(i, val):
-            val = val.at[i, l[i]].add(d_l[i])
-            val = val.at[i, u[i]].add(d_u[i])
-            return val
-
-        target_pmfs = jax.lax.fori_loop(0, batch_size, project_sample, target_pmfs)
+        target_pmfs = jax.vmap(project_one)(l, u, d_l, d_u)
         target_pmfs = jax.lax.stop_gradient(target_pmfs)
 
         def loss_fn(params):
@@ -371,11 +368,11 @@ def single_run(config: dict):
 
         (state, rng), losses = jax.lax.cond(
             can_train,
-            lambda c: jax.lax.scan(do_update, c, None, length=1),
-            lambda c: (c, jnp.zeros(1)),
+            lambda c: jax.lax.scan(do_update, c, None, length=updates_per_step),
+            lambda c: (c, jnp.zeros(updates_per_step)),
             (state, rng),
         )
-        avg_loss = losses[0]
+        avg_loss = jnp.mean(losses)
 
         update_target_flag = jnp.logical_and(
             can_train,
@@ -401,7 +398,7 @@ def single_run(config: dict):
             print(f"model saved to {model_path}")
 
         print(f"running evaluation at step {step_count}...")
-        reset_keys = jax.random.split(jax.random.PRNGKey(config["SEED"]), eval_episodes)
+        reset_keys = jax.random.split(jax.random.PRNGKey(config["SEED"] + step_count), eval_episodes)
         episodic_returns, _, _ = eval_fn(agent_state.params, reset_keys, 0.05)
         avg_eval_return = float(jnp.mean(episodic_returns))
         wandb.log({"charts/episodic_return": avg_eval_return}, step=step_count)

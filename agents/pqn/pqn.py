@@ -132,7 +132,7 @@ def single_run(config: dict) -> dict:
     num_iterations    = total_timesteps // batch_size
     exploration_steps = float(exploration_fraction * total_timesteps)
 
-    run_name = f"{game}_{exp_name}_{'pixel' if pixel_based else 'oc'}_{seed}"
+    run_name = config.get("RUN_NAME") or f"{game}_{exp_name}_{'pixel' if pixel_based else 'oc'}_{seed}"
 
     wandb.init(
         project=config.get("PROJECT", "jaxatari-pqn"),

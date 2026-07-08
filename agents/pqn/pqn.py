@@ -277,49 +277,53 @@ def single_run(config: dict) -> dict:
         return q_state, loss, q_val, key
 
     avg_returns = deque(maxlen=20)
-    global_step = jnp.int32(0)
-    start_time  = time.time()
+    start_time = time.time()
 
-    for iteration in range(1, num_iterations + 1):
+    CHUNK_ITERS = int(config.get("CHUNK_ITERS", 32))
 
+    def one_iteration(carry, _):
+        q_state, env_states, next_obs, next_done, key, global_step = carry
         (_, env_states, next_obs, next_done, key, global_step), storage, infos = rollout(
             q_state.params, env_states, next_obs, next_done, key, global_step
         )
-
-        gs = int(global_step)
-        if "returned_episode" in infos:
-            finished = np.array(infos["returned_episode"])
-            ep_rets  = np.array(infos["returned_episode_returns"])
-            for ret in ep_rets[finished]:
-                avg_returns.append(float(ret))
-            if finished.any():
-                wandb.log({
-                    "charts/episodic_return": float(ep_rets[finished].mean()),
-                    "charts/avg_episodic_return": float(np.mean(avg_returns)),
-                }, step=gs)
-
         storage = compute_q_lambda(q_state, next_obs, next_done, storage)
-
-        update_t0 = time.time()
         q_state, loss, q_val, key = update_pqn(q_state, storage, key)
-        update_time = time.time() - update_t0
+        out = (infos["returned_episode"], infos["returned_episode_returns"],
+               loss[-1, -1], q_val[-1, -1])
+        return (q_state, env_states, next_obs, next_done, key, global_step), out
 
-        sps        = int(gs / (time.time() - start_time))
-        sps_update = int(batch_size / update_time)
-        epsilon    = float(jnp.maximum(
-            end_e, start_e + (end_e - start_e) * gs / exploration_steps
-        ))
-        if iteration % 10 == 0 or iteration == num_iterations:
-            wandb.log({
-                "charts/global_step": gs,
-                "charts/epsilon":     epsilon,
-                "charts/SPS":         sps,
-                "charts/SPS_update":  sps_update,
-                "losses/td_loss":     float(loss[-1, -1]),
-                "losses/q_values":    float(q_val[-1, -1]),
-            }, step=gs)
+    @jax.jit
+    def train_chunk(carry):
+        return jax.lax.scan(one_iteration, carry, None, length=CHUNK_ITERS)
 
-        if iteration % max(1, num_iterations // 20) == 0:
+    carry = (q_state, env_states, next_obs, next_done, key, jnp.int32(0))
+    num_chunks = num_iterations // CHUNK_ITERS
+    print(f"[PQN] chunked training: {num_chunks} chunks x {CHUNK_ITERS} iters "
+          f"({CHUNK_ITERS * batch_size} steps/chunk)")
+
+    for chunk in range(1, num_chunks + 1):
+        carry, (fin, rets, losses, qvals) = train_chunk(carry)
+        q_state = carry[0]
+        gs = int(carry[5])
+        fin = np.array(fin).reshape(-1)
+        rets = np.array(rets).reshape(-1)
+        ep = rets[fin]
+        for r in ep[-20:]:
+            avg_returns.append(float(r))
+        epsilon = float(max(end_e, start_e + (end_e - start_e) * gs / exploration_steps))
+        sps = int(gs / (time.time() - start_time))
+        logd = {
+            "charts/global_step": gs,
+            "charts/epsilon": epsilon,
+            "charts/SPS": sps,
+            "losses/td_loss": float(np.array(losses)[-1]),
+            "losses/q_values": float(np.array(qvals)[-1]),
+        }
+        if ep.size:
+            logd["charts/episodic_return"] = float(ep.mean())
+            logd["charts/avg_episodic_return"] = float(np.mean(avg_returns))
+        wandb.log(logd, step=gs)
+        if chunk % max(1, num_chunks // 20) == 0:
             print(f"step: {gs}/{total_timesteps} | SPS: {sps} | "
                   f"avg_return: {np.mean(avg_returns) if avg_returns else 0:.2f}")
 

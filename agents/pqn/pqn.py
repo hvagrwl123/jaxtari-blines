@@ -292,8 +292,9 @@ def single_run(config: dict) -> dict:
             ep_rets  = np.array(infos["returned_episode_returns"])
             for ret in ep_rets[finished]:
                 avg_returns.append(float(ret))
+            if finished.any():
                 wandb.log({
-                    "charts/episodic_return":     float(ret),
+                    "charts/episodic_return": float(ep_rets[finished].mean()),
                     "charts/avg_episodic_return": float(np.mean(avg_returns)),
                 }, step=gs)
 
@@ -308,14 +309,15 @@ def single_run(config: dict) -> dict:
         epsilon    = float(jnp.maximum(
             end_e, start_e + (end_e - start_e) * gs / exploration_steps
         ))
-        wandb.log({
-            "charts/global_step": gs,
-            "charts/epsilon":     epsilon,
-            "charts/SPS":         sps,
-            "charts/SPS_update":  sps_update,
-            "losses/td_loss":     float(loss[-1, -1]),
-            "losses/q_values":    float(q_val[-1, -1]),
-        }, step=gs)
+        if iteration % 10 == 0 or iteration == num_iterations:
+            wandb.log({
+                "charts/global_step": gs,
+                "charts/epsilon":     epsilon,
+                "charts/SPS":         sps,
+                "charts/SPS_update":  sps_update,
+                "losses/td_loss":     float(loss[-1, -1]),
+                "losses/q_values":    float(q_val[-1, -1]),
+            }, step=gs)
 
         if iteration % max(1, num_iterations // 20) == 0:
             print(f"step: {gs}/{total_timesteps} | SPS: {sps} | "

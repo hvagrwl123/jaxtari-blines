@@ -1,5 +1,5 @@
-# Adapted from https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/c51_atari_jax.py
 import os
+import random
 import time
 from functools import partial
 
@@ -72,49 +72,90 @@ def make_env(env_id, mods=[], pixel_based=True, native_downscaling=True, eval=Fa
     return thunk
 
 
-class QNetworkPixel(nn.Module):
+class Actor(nn.Module):
+    """Categorical policy over discrete actions (no BatchNorm, plain torso)."""
     action_dim: int
-    n_atoms: int
+    pixel_based: bool
+    hidden_size: int = 512
 
     @nn.compact
     def __call__(self, x):
-        x = jnp.transpose(x, (0, 2, 3, 1))
-        x = x.astype(jnp.float32) / 255.0
-        x = nn.Conv(32, kernel_size=(8, 8), strides=(4, 4), padding="VALID")(x)
-        x = nn.relu(x)
-        x = nn.Conv(64, kernel_size=(4, 4), strides=(2, 2), padding="VALID")(x)
-        x = nn.relu(x)
-        x = nn.Conv(64, kernel_size=(3, 3), strides=(1, 1), padding="VALID")(x)
-        x = nn.relu(x)
-        x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(512)(x)
-        x = nn.relu(x)
-        x = nn.Dense(self.action_dim * self.n_atoms)(x)
-        x = x.reshape((x.shape[0], self.action_dim, self.n_atoms))
-        return jax.nn.softmax(x, axis=-1)
+        if self.pixel_based:
+            x = jnp.transpose(x, (0, 2, 3, 1))
+            x = x.astype(jnp.float32) / 255.0
+            x = nn.Conv(32, kernel_size=(8, 8), strides=(4, 4), padding="VALID")(x)
+            x = nn.relu(x)
+            x = nn.Conv(64, kernel_size=(4, 4), strides=(2, 2), padding="VALID")(x)
+            x = nn.relu(x)
+            x = nn.Conv(64, kernel_size=(3, 3), strides=(1, 1), padding="VALID")(x)
+            x = nn.relu(x)
+            x = x.reshape((x.shape[0], -1))
+            x = nn.Dense(self.hidden_size)(x)
+            x = nn.relu(x)
+        else:
+            x = x.astype(jnp.float32)
+            x = nn.Dense(self.hidden_size)(x)
+            x = nn.LayerNorm()(x)
+            x = nn.relu(x)
+            x = nn.Dense(self.hidden_size)(x)
+            x = nn.LayerNorm()(x)
+            x = nn.relu(x)
+        return nn.Dense(self.action_dim)(x)
 
 
-class QNetworkOC(nn.Module):
+class SingleCritic(nn.Module):
+    """Q(s, .) with BatchNorm torso (CrossQ). train=True updates batch stats."""
     action_dim: int
-    n_atoms: int
+    pixel_based: bool
+    hidden_size: int = 1024
+    bn_momentum: float = 0.99
 
     @nn.compact
-    def __call__(self, x):
-        x = x.astype(jnp.float32)
-        x = nn.Dense(512)(x)
-        x = nn.LayerNorm()(x)
-        x = nn.relu(x)
-        x = nn.Dense(512)(x)
-        x = nn.LayerNorm()(x)
-        x = nn.relu(x)
-        x = nn.Dense(self.action_dim * self.n_atoms)(x)
-        x = x.reshape((x.shape[0], self.action_dim, self.n_atoms))
-        return jax.nn.softmax(x, axis=-1)
+    def __call__(self, x, train: bool):
+        norm = partial(nn.BatchNorm, use_running_average=not train, momentum=self.bn_momentum)
+        if self.pixel_based:
+            x = jnp.transpose(x, (0, 2, 3, 1))
+            x = x.astype(jnp.float32) / 255.0
+            x = nn.Conv(32, kernel_size=(8, 8), strides=(4, 4), padding="VALID")(x)
+            x = norm()(x)
+            x = nn.relu(x)
+            x = nn.Conv(64, kernel_size=(4, 4), strides=(2, 2), padding="VALID")(x)
+            x = norm()(x)
+            x = nn.relu(x)
+            x = nn.Conv(64, kernel_size=(3, 3), strides=(1, 1), padding="VALID")(x)
+            x = norm()(x)
+            x = nn.relu(x)
+            x = x.reshape((x.shape[0], -1))
+            x = nn.Dense(self.hidden_size)(x)
+            x = norm()(x)
+            x = nn.relu(x)
+        else:
+            x = x.astype(jnp.float32)
+            x = nn.Dense(self.hidden_size)(x)
+            x = norm()(x)
+            x = nn.relu(x)
+            x = nn.Dense(self.hidden_size)(x)
+            x = norm()(x)
+            x = nn.relu(x)
+        return nn.Dense(self.action_dim)(x)
 
 
-class C51TrainState(TrainState):
-    target_params: flax.core.FrozenDict
-    atoms: jnp.ndarray
+class TwinCritic(nn.Module):
+    """Two independent critics evaluated in one call -> (2, B, A)."""
+    action_dim: int
+    pixel_based: bool
+    hidden_size: int = 1024
+    bn_momentum: float = 0.99
+
+    @nn.compact
+    def __call__(self, x, train: bool):
+        q1 = SingleCritic(self.action_dim, self.pixel_based, self.hidden_size, self.bn_momentum)(x, train)
+        q2 = SingleCritic(self.action_dim, self.pixel_based, self.hidden_size, self.bn_momentum)(x, train)
+        return jnp.stack([q1, q2], axis=0)
+
+
+class CriticTrainState(TrainState):
+    batch_stats: flax.core.FrozenDict
 
 
 @flax.struct.dataclass
@@ -125,8 +166,8 @@ class EpisodeStatistics:
     returned_episode_lengths: jnp.array
 
 
-def build_eval_fn(env, apply_fn, v_min, v_max, n_atoms, eval_episodes, max_steps, action_dim):
-    atoms = jnp.linspace(v_min, v_max, n_atoms)
+def build_eval_fn(env, actor_apply, eval_episodes, max_steps, action_dim):
+    """Full eval: per-episode returns + first-env state history (for videos)."""
 
     def wrapped_reset(key):
         next_obs, state = env.reset(key)
@@ -138,9 +179,8 @@ def build_eval_fn(env, apply_fn, v_min, v_max, n_atoms, eval_episodes, max_steps
         return next_obs.squeeze()[None, ...], next_state, reward, done, info
 
     def get_action(params, obs, key, epsilon):
-        pmfs = apply_fn(params, obs)
-        q_values = (pmfs * atoms[None, None, :]).sum(-1)
-        greedy_action = jnp.argmax(q_values, axis=1)
+        logits = actor_apply(params, obs)
+        greedy_action = jnp.argmax(logits, axis=1)
         key, subkey = jax.random.split(key)
         random_action = jax.random.randint(subkey, greedy_action.shape, 0, action_dim)
         explore = jax.random.uniform(key, greedy_action.shape) < epsilon
@@ -171,7 +211,6 @@ def build_eval_fn(env, apply_fn, v_min, v_max, n_atoms, eval_episodes, max_steps
 
 
 def single_run(config: dict):
-    import random
     config = {k.upper(): v for k, v in config.items() if k != "alg"}
 
     if isinstance(config.get("TRAIN_MODS"), list):
@@ -191,7 +230,6 @@ def single_run(config: dict):
         save_code=True,
     )
 
-    # do not modify the seeding
     random.seed(config["SEED"])
     np.random.seed(config["SEED"])
     key = jax.random.PRNGKey(config["SEED"])
@@ -221,40 +259,45 @@ def single_run(config: dict):
         next_done = jnp.logical_or(terminated, truncated)
         return next_obs.reshape(action.shape[0], *obs_shape), state, reward, next_done, info
 
-    n_atoms = config.get("N_ATOMS", 51)
-    v_min = config.get("V_MIN", -10.0)
-    v_max = config.get("V_MAX", 10.0)
-    atoms = jnp.linspace(v_min, v_max, n_atoms)
-    delta_z = (v_max - v_min) / (n_atoms - 1)
-
-    key, q_key = jax.random.split(key, 2)
-    network = (
-        QNetworkPixel(action_dim=action_dim, n_atoms=n_atoms)
-        if pixel_based
-        else QNetworkOC(action_dim=action_dim, n_atoms=n_atoms)
+    key, actor_key, critic_key = jax.random.split(key, 3)
+    actor = Actor(action_dim=action_dim, pixel_based=pixel_based)
+    critic = TwinCritic(
+        action_dim=action_dim,
+        pixel_based=pixel_based,
+        hidden_size=config.get("CRITIC_HIDDEN", 1024),
+        bn_momentum=config.get("BN_MOMENTUM", 0.99),
     )
 
     dummy_obs = jnp.zeros((1, *obs_shape))
-    q_params = network.init(q_key, dummy_obs)
+    actor_params = actor.init(actor_key, dummy_obs)
+    critic_variables = critic.init(critic_key, dummy_obs, train=False)
 
-    tx = optax.adam(
-        learning_rate=config.get("LEARNING_RATE"),
-        eps=0.01 / config.get("BATCH_SIZE", 32),
+    adam_b1 = config.get("ADAM_B1", 0.5)
+    actor_state = TrainState.create(
+        apply_fn=actor.apply,
+        params=actor_params,
+        tx=optax.adam(learning_rate=config.get("ACTOR_LR", 3e-4), b1=adam_b1),
+    )
+    critic_state = CriticTrainState.create(
+        apply_fn=critic.apply,
+        params=critic_variables["params"],
+        batch_stats=critic_variables["batch_stats"],
+        tx=optax.adam(learning_rate=config.get("CRITIC_LR", 3e-4), b1=adam_b1),
     )
 
-    agent_state = C51TrainState.create(
-        apply_fn=network.apply,
-        params=q_params,
-        target_params=jax.tree.map(jnp.copy, q_params),
-        atoms=atoms,
-        tx=tx,
+    target_entropy = -config.get("TARGET_ENTROPY_SCALE", 0.3) * jnp.log(1.0 / action_dim)
+    log_alpha_max = jnp.log(config.get("ALPHA_MAX", 1.0))
+    alpha_state = TrainState.create(
+        apply_fn=lambda params, _=None: params,
+        params={"log_alpha": jnp.zeros(())},
+        tx=optax.adam(learning_rate=config.get("ALPHA_LR", 3e-4), b1=adam_b1),
     )
 
     obs_dtype = jnp.uint8 if pixel_based else jnp.float16
     replay_buffer = fbx.make_item_buffer(
-        max_length=config.get("BUFFER_SIZE", 100000),
+        max_length=config.get("BUFFER_SIZE", 200000),
         min_length=config.get("LEARNING_STARTS", 10000),
-        sample_batch_size=config.get("BATCH_SIZE", 32),
+        sample_batch_size=config.get("BATCH_SIZE", 64),
         add_batches=True,
     )
     example_transition = {
@@ -294,10 +337,7 @@ def single_run(config: dict):
         )()
         eval_fns[mod_label] = build_eval_fn(
             env=eval_env,
-            apply_fn=network.apply,
-            v_min=v_min,
-            v_max=v_max,
-            n_atoms=n_atoms,
+            actor_apply=actor.apply,
             eval_episodes=eval_episodes,
             max_steps=eval_max_steps,
             action_dim=action_dim,
@@ -306,56 +346,92 @@ def single_run(config: dict):
     eval_reset_keys = jax.random.split(jax.random.PRNGKey(config["SEED"]), eval_episodes)
 
     gamma = config.get("GAMMA", 0.99)
-    batch_size = config.get("BATCH_SIZE", 32)
+    batch_size = config.get("BATCH_SIZE", 64)
+    policy_delay = int(config.get("POLICY_DELAY", 3))
     updates_per_step = max(1, num_envs // config.get("TRAIN_FREQUENCY", 4))
 
-    def update(agent_state, b_obs, b_act, b_nobs, b_rew, b_don):
-        next_pmfs = network.apply(agent_state.target_params, b_nobs)
-        next_vals = (next_pmfs * agent_state.atoms[None, None, :]).sum(-1)
-        next_act = jnp.argmax(next_vals, axis=-1)
-        next_pmfs = next_pmfs[jnp.arange(batch_size), next_act]
+    def update(actor_state, critic_state, alpha_state, b_obs, b_act, b_nobs, b_rew, b_don):
+        alpha = jnp.exp(alpha_state.params["log_alpha"])
 
-        next_atoms = b_rew[:, None] + gamma * agent_state.atoms[None, :] * (1.0 - b_don[:, None])
-        tz = jnp.clip(next_atoms, v_min, v_max)
-        b = (tz - v_min) / delta_z
-        l = jnp.clip(jnp.floor(b).astype(jnp.int32), 0, n_atoms - 1)
-        u = jnp.clip(jnp.ceil(b).astype(jnp.int32), 0, n_atoms - 1)
-        d_l = (u.astype(jnp.float32) + (l == u).astype(jnp.float32) - b) * next_pmfs
-        d_u = (b - l.astype(jnp.float32)) * next_pmfs
+        next_logits = actor.apply(actor_state.params, b_nobs)
+        next_logp = jax.nn.log_softmax(next_logits, axis=-1)
+        next_probs = jnp.exp(next_logp)
 
-        def project_one(l_i, u_i, dl_i, du_i):
-            return jnp.zeros(n_atoms).at[l_i].add(dl_i).at[u_i].add(du_i)
+        def critic_loss_fn(params, batch_stats):
+            joint = jnp.concatenate([b_obs, b_nobs], axis=0)
+            q_joint, mutated = critic.apply(
+                {"params": params, "batch_stats": batch_stats},
+                joint, train=True, mutable=["batch_stats"],
+            )
+            q_s, q_ns = jnp.split(q_joint, 2, axis=1)
+            q_ns = jax.lax.stop_gradient(q_ns)
 
-        target_pmfs = jax.vmap(project_one)(l, u, d_l, d_u)
-        target_pmfs = jax.lax.stop_gradient(target_pmfs)
+            min_q_ns = jnp.min(q_ns, axis=0)
+            soft_v = jnp.sum(next_probs * (min_q_ns - alpha * next_logp), axis=-1)
+            y = jax.lax.stop_gradient(b_rew + gamma * (1.0 - b_don) * soft_v)
 
-        def loss_fn(params):
-            pmfs = network.apply(params, b_obs)
-            q_pred = pmfs[jnp.arange(batch_size), b_act]
-            q_pred_clipped = jnp.clip(q_pred, 1e-5, 1 - 1e-5)
-            loss = -(target_pmfs * jnp.log(q_pred_clipped)).sum(-1).mean()
-            return loss, q_pred
+            q_pred = q_s[:, jnp.arange(batch_size), b_act]
+            loss = jnp.mean((q_pred - y[None, :]) ** 2)
+            return loss, mutated["batch_stats"]
 
-        (loss, _), grads = jax.value_and_grad(loss_fn, has_aux=True)(agent_state.params)
-        new_state = agent_state.apply_gradients(grads=grads)
-        return new_state, loss
+        (critic_loss, new_batch_stats), critic_grads = jax.value_and_grad(
+            critic_loss_fn, has_aux=True
+        )(critic_state.params, critic_state.batch_stats)
+        critic_state = critic_state.apply_gradients(grads=critic_grads)
+        critic_state = critic_state.replace(batch_stats=new_batch_stats)
+
+        def actor_alpha_update(_):
+            q_all = critic.apply(
+                {"params": critic_state.params, "batch_stats": critic_state.batch_stats},
+                b_obs, train=False,
+            )
+            min_q = jax.lax.stop_gradient(jnp.min(q_all, axis=0))
+
+            def actor_loss_fn(params):
+                logits = actor.apply(params, b_obs)
+                logp = jax.nn.log_softmax(logits, axis=-1)
+                probs = jnp.exp(logp)
+                loss = jnp.mean(jnp.sum(probs * (alpha * logp - min_q), axis=-1))
+                return loss, (probs, logp)
+
+            (a_loss, (probs, logp)), actor_grads = jax.value_and_grad(
+                actor_loss_fn, has_aux=True
+            )(actor_state.params)
+            new_actor_state = actor_state.apply_gradients(grads=actor_grads)
+
+            probs = jax.lax.stop_gradient(probs)
+            logp = jax.lax.stop_gradient(logp)
+
+            def alpha_loss_fn(alpha_params):
+                return jnp.mean(jnp.sum(probs * (-jnp.exp(alpha_params["log_alpha"]) * (logp + target_entropy)), axis=-1))
+
+            al_loss, alpha_grads = jax.value_and_grad(alpha_loss_fn)(alpha_state.params)
+            new_alpha_state = alpha_state.apply_gradients(grads=alpha_grads)
+            new_alpha_state = new_alpha_state.replace(
+                params={"log_alpha": jnp.minimum(new_alpha_state.params["log_alpha"], log_alpha_max)}
+            )
+
+            ent = -jnp.mean(jnp.sum(probs * logp, axis=-1))
+            return new_actor_state, new_alpha_state, a_loss, al_loss, ent
+
+        def skip_update(_):
+            zero = jnp.asarray(0.0, jnp.float32)
+            return actor_state, alpha_state, zero, zero, zero
+
+        actor_state, alpha_state, actor_loss, alpha_loss, entropy = jax.lax.cond(
+            (critic_state.step % policy_delay) == 0,
+            actor_alpha_update,
+            skip_update,
+            None,
+        )
+        return actor_state, critic_state, alpha_state, critic_loss, actor_loss, alpha_loss, entropy
 
     def step_once(carry, _):
-        state, buffer_state, env_state, obs, rng, global_step, ep_stats = carry
+        actor_state, critic_state, alpha_state, buffer_state, env_state, obs, rng, global_step, ep_stats = carry
 
-        rng, action_rng, explore_rng = jax.random.split(rng, 3)
-        epsilon = jnp.interp(
-            global_step,
-            jnp.array([0, config.get("EXPLORATION_FRACTION", 0.10) * config.get("TOTAL_TIMESTEPS", 10000000)]),
-            jnp.array([config.get("START_E", 1.0), config.get("END_E", 0.01)]),
-        )
-
-        pmfs = state.apply_fn(state.params, obs)
-        q_values = (pmfs * state.atoms[None, None, :]).sum(-1)
-        greedy_actions = q_values.argmax(axis=-1)
-        random_actions = jax.random.randint(action_rng, (num_envs,), 0, action_dim)
-        explore_mask = jax.random.uniform(explore_rng, (num_envs,)) < epsilon
-        actions = jnp.where(explore_mask, random_actions, greedy_actions)
+        rng, action_rng = jax.random.split(rng)
+        logits = actor.apply(actor_state.params, obs)
+        actions = jax.random.categorical(action_rng, logits, axis=-1)
 
         next_obs, next_env_state, rewards, next_done, infos = vmap_step(env_state, actions)
 
@@ -378,57 +454,45 @@ def single_run(config: dict):
         )
 
         def do_update(update_carry, _):
-            u_state, u_key = update_carry
+            a_state, c_state, al_state, u_key = update_carry
             u_key, sample_key = jax.random.split(u_key)
             batch = replay_buffer.sample(buffer_state, sample_key).experience
-            new_u_state, loss = update(
-                u_state,
+            a_state, c_state, al_state, critic_loss, actor_loss, alpha_loss, entropy = update(
+                a_state, c_state, al_state,
                 batch["obs"].astype(jnp.float32),
                 batch["action"],
                 batch["next_obs"].astype(jnp.float32),
                 batch["reward"],
                 batch["done"].astype(jnp.float32),
             )
-            return (new_u_state, u_key), loss
+            return (a_state, c_state, al_state, u_key), (critic_loss, actor_loss, alpha_loss, entropy)
 
         should_train = (global_step % config.get("TRAIN_FREQUENCY", 4)) < num_envs
         can_train = jnp.logical_and(replay_buffer.can_sample(buffer_state), should_train)
 
-        (state, rng), losses = jax.lax.cond(
+        (actor_state, critic_state, alpha_state, rng), (critic_losses, actor_losses, alpha_losses, entropies) = jax.lax.cond(
             can_train,
             lambda c: jax.lax.scan(do_update, c, None, length=updates_per_step),
-            lambda c: (c, jnp.zeros(updates_per_step)),
-            (state, rng),
+            lambda c: (c, (jnp.zeros(updates_per_step), jnp.zeros(updates_per_step), jnp.zeros(updates_per_step), jnp.zeros(updates_per_step))),
+            (actor_state, critic_state, alpha_state, rng),
         )
-        avg_loss = jnp.mean(losses)
-
-        update_target_flag = jnp.logical_and(
-            can_train,
-            (global_step % config.get("TARGET_NETWORK_FREQUENCY", 10000)) < num_envs,
-        )
-        new_target_params = jax.lax.cond(
-            update_target_flag,
-            lambda _: optax.incremental_update(state.params, state.target_params, 1.0),
-            lambda _: state.target_params,
-            None,
-        )
-        state = state.replace(target_params=new_target_params)
 
         global_step += num_envs
-        return (state, buffer_state, next_env_state, next_obs, rng, global_step, ep_stats), (avg_loss, epsilon)
+        new_carry = (actor_state, critic_state, alpha_state, buffer_state, next_env_state, next_obs, rng, global_step, ep_stats)
+        return new_carry, (jnp.mean(critic_losses), jnp.mean(actor_losses), jnp.mean(alpha_losses), jnp.mean(entropies))
 
-    def save_and_eval(step_count, agent_state):
+    def save_and_eval(step_count, params):
         if config.get("SAVE_PATH", "./models") is not None:
             model_path = f'{config.get("SAVE_PATH", "./models")}/{run_name}/{config["EXP_NAME"]}_{step_count}_{int(time.time())}.cleanrl_model'
             os.makedirs(os.path.dirname(model_path), exist_ok=True)
             with open(model_path, "wb") as f:
-                f.write(flax.serialization.to_bytes((None, agent_state.params)))
+                f.write(flax.serialization.to_bytes((None, params)))
             print(f"model saved to {model_path}")
 
         metrics = {}
         for mods_cfg, mod_label in eval_configs:
             episodic_returns, first_states_history, first_done = eval_fns[mod_label](
-                agent_state.params, eval_reset_keys, 0.05
+                params, eval_reset_keys, 0.05
             )
             avg_eval_return = float(jnp.mean(episodic_returns))
             return_key = f"eval/episodic_return_{mod_label}"
@@ -462,7 +526,7 @@ def single_run(config: dict):
     obs, env_state = vmap_reset(jax.random.split(reset_key, num_envs))
     global_step = jnp.array(0, dtype=jnp.int32)
 
-    carry = (agent_state, buffer_state, env_state, obs, key, global_step, episode_stats)
+    carry = (actor_state, critic_state, alpha_state, buffer_state, env_state, obs, key, global_step, episode_stats)
 
     start_time = time.time()
     total_eval_time = 0.0
@@ -472,25 +536,27 @@ def single_run(config: dict):
 
     for i in range(1, total_iterations + 1):
         iteration_time_start = time.time()
-        carry, (losses, epsilons) = rollout_chunk(carry)
+        carry, (critic_losses, actor_losses, alpha_losses, entropies) = rollout_chunk(carry)
 
-        agent_state, buffer_state, env_state, obs, key, global_step, episode_stats = carry
+        actor_state, critic_state, alpha_state, buffer_state, env_state, obs, key, global_step, episode_stats = carry
 
         current_step = global_step.item()
         iteration_time = time.time() - iteration_time_start
 
         if config.get("EVAL_DURING_TRAIN", True) and (i % config.get("EVAL_EVERY", 10) == 0):
             eval_t0 = time.time()
-            save_and_eval(current_step, agent_state)
+            save_and_eval(current_step, actor_state.params)
             total_eval_time += time.time() - eval_t0
 
         metrics = {
             "charts/avg_episodic_return": episode_stats.returned_episode_returns.mean().item(),
             "charts/avg_episodic_length": episode_stats.returned_episode_lengths.mean().item(),
-            "charts/epsilon": epsilons[-1].item(),
+            "charts/alpha": float(jnp.exp(alpha_state.params["log_alpha"])),
+            "charts/policy_entropy": float(jnp.sum(entropies) / jnp.maximum(jnp.sum(entropies != 0), 1)),
             "charts/SPS": int(current_step / (time.time() - start_time - total_eval_time)),
             "charts/SPS_update": int(CHUNK_SIZE * num_envs / iteration_time),
-            "losses/td_loss": float(jnp.sum(losses) / jnp.maximum(jnp.sum(losses != 0), 1)),
+            "losses/critic_loss": float(jnp.sum(critic_losses) / jnp.maximum(jnp.sum(critic_losses != 0), 1)),
+            "losses/actor_loss": float(jnp.sum(actor_losses) / jnp.maximum(jnp.sum(actor_losses != 0), 1)),
             "charts/global_step": current_step,
         }
         wandb.log(metrics, step=current_step)
@@ -499,8 +565,7 @@ def single_run(config: dict):
             sps = int(current_step / (time.time() - start_time - total_eval_time))
             print(f"step: {current_step} / {config.get('TOTAL_TIMESTEPS')} | SPS: {sps} | return: {episode_stats.returned_episode_returns.mean().item():.2f}")
 
-    eval_metrics = save_and_eval(config.get("TOTAL_TIMESTEPS", 10000000), agent_state)
+    eval_metrics = save_and_eval(config.get("TOTAL_TIMESTEPS", 10000000), actor_state.params)
 
     wandb.finish()
-
     return eval_metrics

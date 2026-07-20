@@ -22,12 +22,6 @@ from jaxatari.wrappers import (
 )
 import wandb
 
-try:
-    import tqdx as _tqdx
-except ImportError:
-    _tqdx = None
-
-
 @flax.struct.dataclass
 class Storage:
     obs:     jnp.array
@@ -164,52 +158,8 @@ def build_eval_fn(env, apply_fn, action_dim, max_steps):
     return eval_fn
 
 
-def build_eval_return_fn(env, apply_fn, action_dim, max_steps):
-    """Lightweight in-scan eval: no state history / videos, returns mean episodic return."""
-
-    def wrapped_reset(key):
-        obs, state = env.reset(key)
-        return obs[None, ...], state
-
-    def wrapped_step(state, action):
-        obs, state, reward, terminated, truncated, info = env.step(state, action.squeeze())
-        done = jnp.logical_or(terminated, truncated)
-        return obs[None, ...], state, reward, done
-
-    def get_action(params, obs, key, epsilon):
-        q_values = apply_fn(params, obs)
-        greedy = jnp.argmax(q_values, axis=1)
-        key, subkey = jax.random.split(key)
-        rand = jax.random.randint(subkey, greedy.shape, 0, action_dim)
-        explore = jax.random.uniform(key, greedy.shape) < epsilon
-        return jnp.where(explore, rand, greedy), key
-
-    def step_fn(carry, _):
-        obs, state, keys, params, epsilon = carry
-        actions, keys = jax.vmap(get_action, in_axes=(None, 0, 0, None))(params, obs, keys, epsilon)
-        obs, state, reward, done = jax.vmap(wrapped_step)(state, actions)
-        return (obs, state, keys, params, epsilon), (done, reward)  # no state history
-
-    def eval_return_fn(params, reset_keys, epsilon):
-        obs, state = jax.vmap(wrapped_reset)(reset_keys)
-        _, (dones, rewards) = jax.lax.scan(
-            step_fn, (obs, state, reset_keys, params, epsilon), None, length=max_steps
-        )
-        has_finished = jax.lax.cummax(dones.astype(jnp.int32), axis=0)
-        mask = jnp.pad(has_finished[:-1, :], ((1, 0), (0, 0)), constant_values=0)
-        masked = rewards * (1 - mask)
-        return jnp.mean(jnp.sum(masked, axis=0))
-
-    return eval_return_fn
-
-
 def single_run(config: dict) -> dict:
     config = {k.upper(): v for k, v in config.items() if k.lower() != "alg"}
-
-    if _tqdx is None:
-        raise ImportError(
-            "PQN scanned training needs tqdx: uv add 'tqdx @ git+https://github.com/huterguier/tqdx'"
-        )
 
     if isinstance(config.get("TRAIN_MODS"), list):
         config["TRAIN_MODS"] = tuple(config["TRAIN_MODS"])
@@ -313,10 +263,6 @@ def single_run(config: dict) -> dict:
         )
 
     # in-scan eval runs on the training env config (default game if TRAIN_MODS empty)
-    train_label = "default" if not train_mods else "_".join(str(m) for m in train_mods)
-    inscan_eval_env = make_env(game, mods=train_mods, pixel_based=pixel_based, eval=True)()
-    inscan_eval_fn = build_eval_return_fn(inscan_eval_env, q_network.apply, n_actions, eval_max_steps)
-
     eval_reset_keys = jax.random.split(jax.random.PRNGKey(seed), eval_episodes)
 
     def step_once(carry, _):
@@ -444,87 +390,50 @@ def single_run(config: dict) -> dict:
                 print(f"video (eval) logged with {frames.shape} frames ({mod_label}).")
         return metrics
 
-    eval_every = config.get("EVAL_EVERY", 100)
-    eval_during_train = config.get("EVAL_DURING_TRAIN", True)
+    global_step = jnp.int32(0)
+    start_time = time.time()
+    compile_time = None
 
-    steps_per_chunk = batch_size  # num_envs * num_steps per outer iteration
-    _timing = {"start": None, "start_step": 0, "last": None}
+    print(f"[PQN] starting run ({num_iterations} iterations of {batch_size} steps)")
 
-    def log_cb(m):
-        now = time.time()
-        step = int(m["charts/global_step"])
-        d = {k: float(v) for k, v in m.items()}
-        d["charts/global_step"] = step
-        if _timing["start"] is None:
-            _timing["start"] = now
-            _timing["start_step"] = step
-            _timing["last"] = now
-        else:
-            dt = now - _timing["last"]
-            elapsed = now - _timing["start"]
-            d["charts/SPS_update"] = int(steps_per_chunk / dt) if dt > 0 else 0
-            d["charts/SPS"] = int((step - _timing["start_step"]) / elapsed) if elapsed > 0 else 0
-            _timing["last"] = now
-        wandb.log(d, step=step)
+    for iteration in range(1, num_iterations + 1):
+        if config.get("EVAL_DURING_TRAIN", True) and iteration % config.get("EVAL_EVERY", 100) == 0:
+            save_and_eval(int(global_step), q_state)
 
-    def outer_step(carry, i):
-        runner_state, last_eval = carry
-        q_state, env_states, next_obs, next_done, key, global_step = runner_state
+        iteration_time_start = time.time()
         (_, env_states, next_obs, next_done, key, global_step), storage, infos = rollout(
             q_state.params, env_states, next_obs, next_done, key, global_step
         )
         storage = compute_q_lambda(q_state, next_obs, next_done, storage)
         q_state, loss, q_val, key = update_pqn(q_state, storage, key)
 
-        if eval_during_train:
-            eval_return = jax.lax.cond(
-                (i % eval_every) == 0,
-                lambda p: inscan_eval_fn(p, eval_reset_keys, 0.05),
-                lambda p: last_eval,
-                q_state.params,
-            )
-        else:
-            eval_return = last_eval
+        if compile_time is None:
+            compile_time = time.time()
+            print(f"Compile + first iteration time: {compile_time - start_time:.2f} seconds.")
 
-        epsilon = jnp.maximum(
-            end_e,
-            start_e + (end_e - start_e) * global_step.astype(jnp.float32) / exploration_steps,
-        )
+        current_step = int(global_step)
+        epsilon = max(end_e, start_e + (end_e - start_e) * current_step / exploration_steps)
+
         metrics = {
-            "charts/global_step": global_step,
-            "charts/avg_episodic_return": infos["returned_episode_returns"][-1].mean(),
-            "charts/avg_episodic_length": infos["returned_episode_lengths"][-1].mean().astype(jnp.float32),
+            "charts/avg_episodic_return": infos["returned_episode_returns"][-1].mean().item(),
+            "charts/avg_episodic_length": infos["returned_episode_lengths"][-1].mean().item(),
             "charts/epsilon": epsilon,
-            "losses/td_loss": loss[-1, -1],
-            "losses/q_values": q_val[-1, -1],
+            "losses/td_loss": loss[-1, -1].item(),
+            "losses/q_values": q_val[-1, -1].item(),
+            "charts/SPS": int(current_step / (time.time() - start_time)),
+            "charts/SPS_update": int(batch_size / (time.time() - iteration_time_start)),
+            "charts/time": time.time() - start_time,
+            "charts/global_step": current_step,
         }
-        if eval_during_train:
-            metrics[f"eval/episodic_return_{train_label}"] = eval_return
-        jax.debug.callback(log_cb, metrics)
+        wandb.log(metrics, step=current_step)
 
-        return ((q_state, env_states, next_obs, next_done, key, global_step), eval_return), None
+    end_time = time.time()
+    print("Training done.")
+    if compile_time is not None:
+        print(f"Run time after first iteration: {end_time - compile_time:.2f} seconds.")
+    print(f"Total train time: {end_time - start_time:.2f} seconds / {(end_time - start_time)/60:.2f} minutes.")
 
-    runner_state = (q_state, env_states, next_obs, next_done, key, jnp.int32(0))
-
-    @partial(jax.jit, donate_argnums=(0,))
-    def train(runner_state):
-        if eval_during_train:
-            init_eval = inscan_eval_fn(runner_state[0].params, eval_reset_keys, 0.05)
-        else:
-            init_eval = jnp.float32(0.0)
-        carry, _ = _tqdx.scan(outer_step, (runner_state, init_eval), jnp.arange(1, num_iterations + 1))
-        return carry
-
-    print(f"[pqn_scan] compiling one scan of {num_iterations} iterations x {batch_size} steps...")
-    start_time = time.time()
-    (runner_state, _last_eval) = jax.block_until_ready(train(runner_state))
-    wall = time.time() - start_time
-
-    q_state = runner_state[0]
-    total_steps = int(runner_state[5])
-    print(f"[pqn_scan] {total_steps} steps in {wall:.1f}s incl. compile -> {int(total_steps / wall)} SPS (compile-inclusive)")
-
-    eval_metrics = save_and_eval(total_steps, q_state)
+    eval_metrics = save_and_eval(int(global_step), q_state)
     wandb.finish()
     print("[PQN] Training complete.")
     return eval_metrics
